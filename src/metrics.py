@@ -78,3 +78,77 @@ def n_relevant_per_query(query_ids, gallery_ids) -> np.ndarray:
     from collections import Counter
     c = Counter(gallery_ids)
     return np.array([c.get(q, 0) for q in query_ids])
+
+
+# ---------------------------------------------------------------------------
+# Re-ranking (검색 후처리, 학습 0) — mAP 개선용
+# ---------------------------------------------------------------------------
+def query_expansion(gallery_vecs, query_vecs, topk=10, alpha=3.0):
+    """
+    Average Query Expansion (αQE): 각 query를 top-k gallery 이웃으로 보강 후 재정규화.
+    학습 없이 query 표현을 풍부하게 만들어 재검색 → recall·mAP 개선.
+    반환: 보강된 query 벡터 (이후 search/evaluate에 그대로 사용).
+    """
+    sims, idx = search(gallery_vecs, query_vecs, topk=topk)
+    g = gallery_vecs.astype("float32")
+    new_q = query_vecs.astype("float32").copy()
+    for qi in range(len(query_vecs)):
+        w = np.maximum(sims[qi], 0.0) ** alpha            # 유사도^alpha 가중
+        agg = (w[:, None] * g[idx[qi]]).sum(0)
+        v = query_vecs[qi] + agg
+        new_q[qi] = v / (np.linalg.norm(v) + 1e-8)
+    return new_q.astype("float32")
+
+
+def idx_from_dist(dist, topk=50):
+    """거리행렬(작을수록 유사)에서 상위 topk 인덱스."""
+    return np.argsort(dist, axis=1)[:, :topk].astype(np.int64)
+
+
+def rerank_kreciprocal(query_vecs, gallery_vecs, k1=20, k2=6, lambda_value=0.3):
+    """
+    k-reciprocal encoding 재순위 (Zhong et al., 2017).
+    상호 최근접(k-reciprocal) 이웃 기반 Jaccard 거리 + 원거리를 결합해 재순위.
+    반환: (Nq, Ng) 최종 거리행렬 (작을수록 유사) → idx_from_dist로 랭킹.
+    """
+    feat = np.concatenate([query_vecs, gallery_vecs]).astype(np.float32)
+    q_num, all_num = len(query_vecs), len(feat)
+    # 정규화 벡터 → 유클리드² = 2-2cos
+    original_dist = 2.0 - 2.0 * (feat @ feat.T)
+    original_dist = np.transpose(original_dist / (np.max(original_dist, axis=0) + 1e-12))
+    V = np.zeros_like(original_dist, dtype=np.float32)
+    initial_rank = np.argsort(original_dist, axis=1).astype(np.int32)
+
+    for i in range(all_num):
+        forward = initial_rank[i, :k1 + 1]
+        backward = initial_rank[forward, :k1 + 1]
+        recip = forward[np.where(backward == i)[0]]
+        recip_exp = recip
+        for j in recip:
+            cand = initial_rank[j, :int(round(k1 / 2)) + 1]
+            cand_back = initial_rank[cand, :int(round(k1 / 2)) + 1]
+            cand_recip = cand[np.where(cand_back == j)[0]]
+            if len(np.intersect1d(cand_recip, recip)) > 2.0 / 3 * len(cand_recip):
+                recip_exp = np.append(recip_exp, cand_recip)
+        recip_exp = np.unique(recip_exp)
+        w = np.exp(-original_dist[i, recip_exp])
+        V[i, recip_exp] = (w / np.sum(w)).astype(np.float32)
+
+    if k2 != 1:                                            # local query expansion
+        V_qe = np.zeros_like(V, dtype=np.float32)
+        for i in range(all_num):
+            V_qe[i] = np.mean(V[initial_rank[i, :k2]], axis=0)
+        V = V_qe
+
+    orig_q = original_dist[:q_num]
+    inv_idx = [np.where(V[:, i] != 0)[0] for i in range(all_num)]  # gallery별 비영 행
+    jaccard = np.zeros((q_num, all_num), dtype=np.float32)
+    for i in range(q_num):
+        tmp_min = np.zeros(all_num, dtype=np.float32)
+        nz = np.where(V[i] != 0)[0]
+        for j in nz:
+            tmp_min[inv_idx[j]] += np.minimum(V[i, j], V[inv_idx[j], j])
+        jaccard[i] = 1.0 - tmp_min / (2.0 - tmp_min + 1e-12)
+
+    final = jaccard * (1 - lambda_value) + orig_q * lambda_value
+    return final[:, q_num:]                                # query×gallery 부분만
