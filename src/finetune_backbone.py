@@ -47,21 +47,23 @@ def _load(path):
     return Image.open(path).convert("RGB")
 
 
-def _build_dinov2(device):
+def _build_dinov2(device, model_name="facebook/dinov2-small"):
     from transformers import AutoModel
-    return AutoModel.from_pretrained("facebook/dinov2-small").to(device)
+    return AutoModel.from_pretrained(model_name).to(device)
 
 
 def finetune_backbone(train_paths, train_labels, epochs=3, P=8, K=4,
                       steps_per_epoch=200, lr=2e-5, temp=0.1, size=224,
-                      unfreeze_blocks=4, device=None, seed=0, log_every=50):
+                      unfreeze_blocks=4, model_name="facebook/dinov2-small",
+                      device=None, seed=0, log_every=50):
     """
     DINOv2 백본을 supervised-contrastive로 fine-tune.
+    model_name: 'facebook/dinov2-small'(384d) 또는 'facebook/dinov2-base'(768d, 더 강함).
     unfreeze_blocks: 뒤에서 몇 개 transformer 블록을 학습할지 (None=전체).
     반환: 학습된 model (encode_backbone로 임베딩 추출).
     """
     device = device or ("cuda" if torch.cuda.is_available() else "cpu")
-    model = _build_dinov2(device)
+    model = _build_dinov2(device, model_name)
 
     if unfreeze_blocks is not None:                       # 뒤쪽 블록만 학습
         for p in model.parameters():
