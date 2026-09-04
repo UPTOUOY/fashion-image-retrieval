@@ -65,9 +65,20 @@ def _resolve_img_root(root: str, sample_name: str) -> str:
 
 def load_inshop(root: str):
     """
-    root: In-Shop 데이터가 풀린 폴더 (하위 어디에 있어도 자동 탐색).
+    root: In-Shop 데이터 폴더.
+    - 주석파일(list_eval_partition.txt)이 있으면 공식 split 사용
+    - 없으면(이미지 폴더만 있는 미러) id 폴더 구조에서 직접 split 구성
     반환: dict(train=Split, query=Split, gallery=Split)
     """
+    try:
+        return _load_from_partition(root)
+    except FileNotFoundError:
+        print("주석파일 없음 → 폴더 구조에서 split 자동 구성")
+        return build_splits_from_folders(root)
+
+
+def _load_from_partition(root: str):
+    """공식 list_eval_partition.txt 기반 로딩."""
     anno = _find_file(root, "list_eval_partition.txt")
     with open(anno, "r", encoding="utf-8") as f:
         lines = f.read().splitlines()
@@ -127,3 +138,60 @@ def cap_gallery(query: Split, gallery: Split, max_gallery: int, seed: int = 0):
         [gallery.item_ids[i] for i in take],
         [gallery.categories[i] for i in take],
     )
+
+
+# ---------------------------------------------------------------------------
+# 폴더 구조 기반 (주석파일 없는 미러: img_highres/MEN|WOMEN/<cat>/id_XXXX/*.jpg)
+# id 폴더 = 같은 상품 = 정답 그룹
+# ---------------------------------------------------------------------------
+_IMG_EXT = (".jpg", ".jpeg", ".png", ".bmp")
+
+
+def _scan_item_folders(root: str):
+    """이미지가 들어있는 말단 폴더(=상품)를 모아 {key: [paths]}, {key: category} 반환."""
+    items = defaultdict(list)
+    cats = {}
+    for dp, _, fn in os.walk(root):
+        imgs = [f for f in fn if f.lower().endswith(_IMG_EXT)]
+        if not imgs:
+            continue
+        rel = os.path.relpath(dp, root).replace("\\", "/")   # 예: img_highres/MEN/Denim/id_00000080
+        key = rel                                            # 폴더경로 = 고유 상품키
+        parts = rel.split("/")
+        cat = "unknown"
+        for i, p in enumerate(parts):                        # MEN/WOMEN + 다음 요소 = 카테고리
+            if p in ("MEN", "WOMEN") and i + 1 < len(parts):
+                cat = f"{p}/{parts[i + 1]}"
+                break
+        for f in imgs:
+            items[key].append(os.path.join(dp, f))
+        cats[key] = cat
+    return items, cats
+
+
+def build_splits_from_folders(root: str, train_ratio: float = 0.5, seed: int = 0):
+    """
+    id 폴더에서 train/query/gallery를 직접 구성.
+    - 이미지 2장 이상인 상품만 사용 (query 1장 + gallery 최소 1장 보장)
+    - 상품 단위로 train/eval 분리 → eval 상품은 첫 장=query, 나머지=gallery
+    """
+    items, cats = _scan_item_folders(root)
+    keys = [k for k, v in items.items() if len(v) >= 2]
+    random.Random(seed).shuffle(keys)
+    n_train = int(len(keys) * train_ratio)
+    train_keys, eval_keys = keys[:n_train], keys[n_train:]
+
+    def make(subset, mode):
+        paths, ids, cs = [], [], []
+        for k in subset:
+            imgs = sorted(items[k])
+            sel = imgs if mode == "train" else (imgs[:1] if mode == "query" else imgs[1:])
+            for p in sel:
+                paths.append(p); ids.append(k); cs.append(cats[k])
+        return Split(paths, ids, cs)
+
+    return {
+        "train":   make(train_keys, "train"),
+        "query":   make(eval_keys, "query"),
+        "gallery": make(eval_keys, "gallery"),
+    }
