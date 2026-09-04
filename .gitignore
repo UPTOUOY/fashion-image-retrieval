@@ -1,0 +1,23 @@
+# 가상환경 / 캐시
+venv/
+__pycache__/
+*.pyc
+
+# 데이터 원본 (7GB) — 절대 커밋하지 않음
+data/
+*.zip
+Img/
+Anno/
+
+# 임베딩 캐시 / 체크포인트 (용량 큼)
+embeddings/
+*.npy
+*.pt
+checkpoints/
+
+# Colab / OS
+.ipynb_checkpoints/
+.DS_Store
+
+# 결과물은 커밋 (아래는 제외 안 함)
+# results/  ← 지표표, 실패 갤러리 이미지는 포폴용이라 커밋 OK
