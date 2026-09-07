@@ -176,7 +176,9 @@ def build_splits_from_folders(root: str, train_ratio: float = 0.5, seed: int = 0
     - 상품 단위로 train/eval 분리 → eval 상품은 첫 장=query, 나머지=gallery
     """
     items, cats = _scan_item_folders(root)
-    keys = [k for k, v in items.items() if len(v) >= 2]
+    # os.walk 순서는 세션/머신마다 달라질 수 있으므로 반드시 정렬해 결정적(deterministic)으로.
+    # 정렬을 안 하면 같은 seed라도 split이 달라져 캐시된 임베딩과 정답 ID가 어긋난다.
+    keys = sorted(k for k, v in items.items() if len(v) >= 2)
     random.Random(seed).shuffle(keys)
     n_train = int(len(keys) * train_ratio)
     train_keys, eval_keys = keys[:n_train], keys[n_train:]

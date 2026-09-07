@@ -1,80 +1,83 @@
-# Fashion Image Retrieval — Zero-shot 임베딩에서 실패를 파고들어 개선하기
+# fashion-image-retrieval
 
-이미지 한 장으로 **"같은 상품"을 찾는** 이미지 임베딩 검색 파이프라인.
-DeepFashion In-Shop 벤치마크에서 zero-shot 임베딩을 baseline으로 두고, **검색 실패 사례를 유형별로 규명한 뒤 그 원인을 겨냥해 개선**했다.
+이미지 한 장으로 같은 상품을 찾는 임베딩 검색을 이틀 잡고 만들어본 기록.
 
-> 이 프로젝트의 초점은 완성도가 아니라 **"왜 안 맞는지 파고들어 데이터·모델·전처리 중 무엇을 고칠지 판단하는 과정"**이다.
+DeepFashion In-Shop으로 zero-shot 임베딩부터 시작해서, 검색이 왜 틀리는지 실패 케이스를 뜯어보고 원인을 잡아가며 성능을 올렸다. 숫자를 자랑하려는 것보다 안 맞을 때 데이터를 고칠지 모델을 고칠지 전처리를 고칠지 판단하는 과정을 남기는 데 초점을 뒀다. (이미지 임베딩/검색 경험을 쌓으려고 시작한 사이드 프로젝트)
 
----
+## 뭘 푸는 문제인가
 
-## 문제 정의
+상품 이미지 한 장(query)을 넣으면 후보 풀(gallery)에서 같은 상품 이미지를 위로 올리는 것. "비슷한 카테고리"가 아니라 "바로 이 상품"을 찾아야 한다. In-Shop은 같은 상품을 포즈·각도 바꿔 찍은 데이터라 이 문제에 맞다.
 
-- **입력**: 상품 이미지 1장 (query)
-- **출력**: gallery(후보 이미지 풀)에서 유사도 상위 k개
-- **정답**: query와 **같은 상품(item_id)** 이미지를 top-k 안에 올렸는가
-- **데이터**: DeepFashion In-Shop Clothes Retrieval (같은 상품을 다른 포즈/각도로 촬영 → 인스턴스 검색)
-- **지표**: Recall@1 / @5 / @10, mAP@10
+- 정답: query와 같은 item_id 이미지가 top-k 안에 있는가
+- 지표: Recall@1/5/10, mAP@10
+- 검색: 임베딩을 L2 정규화한 뒤 내적(=코사인), FAISS `IndexFlatIP`
 
-## 파이프라인
+평가 세트는 query 500상품 / gallery 8,000장이고, train과 eval 상품을 아예 갈라놔서 학습에서 본 상품은 평가에 안 나온다.
 
-```
-이미지 → [임베딩 모델] → L2 정규화 → [FAISS 코사인 검색] → top-k
-                                              │
-                                    [실패 사례 유형화]
-                                              │
-                              데이터 · 모델 · 전처리 개선 실험
-```
+## 어떻게 개선했나
 
-## 접근 (2일 실험 로그)
+DINOv2 zero-shot으로 먼저 재보니 Recall@1이 0.49쯤. 절반은 그냥 맞히는데 나머지가 문제였다.
 
-| 단계 | 내용 |
-|---|---|
-| **Baseline** | DINOv2 / CLIP zero-shot 임베딩으로 Recall@k 측정 |
-| **실패 분석** | top-k에 정답 없는 query를 그리드로 덤프 → 유형 태깅 (같은 카테고리 오검색 / 다른 카테고리 등) |
-| **개선 실험** | 백본 비교(DINOv2·CLIP·ResNet50), 전처리(center-crop), projection head fine-tune |
-| **검증** | 동일 프로토콜로 재평가 → 채택/기각을 수치로 기록 |
+top-5 안에 정답이 없는 실패 168개를 그리드로 뽑아서 눈으로 봤다. 자동 태그로는 "다른 카테고리 오검색"이 제일 많다고 나왔는데, 실제 이미지를 보니 진짜 원인은 따로 있었다. 모델이 옷이 아니라 장면 전체(사람·포즈·구도·배경)를 보고 있었다. "의자에 앉은 사람" query를 넣으면 top-5가 죄다 의자에 앉은 사람이었고 정작 옷은 제각각이었다. 전신샷이라 옷이 화면에서 차지하는 비중이 작아서 배경이랑 포즈가 임베딩을 지배한 셈.
 
-## 결과
+그래서 배경·포즈 맥락을 줄여보려고 center-crop을 먼저 해봤는데 효과가 없었다(0.492 → 0.494). 사람이 여전히 화면을 채우니 당연했다. 결국 전처리로는 안 되고, 같은 상품의 다른 포즈를 서로 가깝게 당기도록 학습(supervised contrastive)하는 게 답이었다.
 
-평가 세트: query 500 상품 / gallery 8,000장 (train·eval 상품 분리 → leakage 없음).
-
-| 방법 | 학습 | Recall@1 | Recall@5 | Recall@10 | mAP@10 | |
+| 방법 | 학습 | R@1 | R@5 | R@10 | mAP@10 | |
 |---|---|---|---|---|---|---|
 | DINOv2 zero-shot | 없음 | 0.492 | 0.664 | 0.726 | 0.200 | baseline |
-| + center-crop | 전처리 | 0.494 | 0.662 | 0.726 | 0.200 | ❌ 기각 |
-| + head-only fine-tune | 얼린 백본 + head | 0.696 | 0.886 | 0.930 | 0.408 | ✅ |
-| + backbone fine-tune (DINOv2-S) | 백본 직접 학습 | 0.852 | 0.946 | 0.962 | 0.553 | ✅ |
-| + backbone fine-tune (DINOv2-B) | 더 큰 백본 | 0.874 | 0.954 | 0.968 | 0.600 | ✅ |
-| **+ 강화 (24k장·6ep·6블록)** | | **0.884** | **0.962** | **0.980** | **0.621** | ✅ 최종 |
+| center-crop | 전처리 | 0.494 | 0.662 | 0.726 | 0.200 | 기각 |
+| head-only fine-tune | 얼린 백본 + head | 0.696 | 0.886 | 0.930 | 0.408 | 채택 |
+| backbone fine-tune (DINOv2-S) | 백본 직접 | 0.852 | 0.946 | 0.962 | 0.553 | 채택 |
+| backbone fine-tune (DINOv2-B) | 더 큰 백본 | 0.874 | 0.954 | 0.968 | 0.600 | 채택 |
+| 강화 (24k장·6ep) | 위 + 데이터·학습량↑ | 0.884 | 0.962 | 0.980 | 0.621 | 최종 |
 
-**Recall@1 0.492 → 0.884 (+80%), mAP@10 0.20 → 0.621 (3.1×), top-5 검색 실패 168 → 19.**
+Recall@1 0.49 → 0.88, mAP 0.20 → 0.62, top-5 실패는 168장에서 19장으로 줄었다.
 
-### 핵심 발견 (실패 분석)
-top-5에 정답이 없는 168개 실패를 눈으로 유형화한 결과, 모델이 **"옷"이 아니라 "장면 전체(사람·포즈·구도)"를 매칭**하는 것이 주 원인이었다.
-- 결정적 증거: "의자에 앉은 사람" query → top-1~5가 전부 *의자에 앉은 사람* (옷은 제각각). 포즈/구도로 뭉침.
-- 전신샷이라 옷이 화면 일부에 불과 → 배경·사람이 임베딩을 지배.
-- **center-crop(전처리)로는 안 풀림** → 같은 상품의 다른 포즈를 가깝게 배우는 **학습(supervised contrastive)**이 근본 처방임을 사다리로 증명.
+얼린 백본 위에 head만 얹어도 0.696까지 오른 건 좀 의외였다(별로일 줄 알았다). 근데 거기서 더 가려면 백본 자체를 다시 학습해야 했다.
 
-## 구조
+## 도메인 모델을 써보니 (제일 흥미로웠던 부분)
+
+범용 DINOv2를 붙잡고 튜닝하는 것 말고, 애초에 패션 데이터로 학습된 모델을 쓰면 어떨까 싶어서 FashionCLIP을 붙여봤다. 이건 split을 새로 짠 별도 실행이라 baseline 숫자가 위 표(0.492)랑 조금 다른데(0.538), 아래 네 줄은 전부 같은 split이라 자기들끼리는 그대로 비교된다.
+
+| 모델 | 학습 | R@1 | R@5 | R@10 | mAP@10 |
+|---|---|---|---|---|---|
+| DINOv2 | zero-shot | 0.538 | 0.710 | 0.790 | 0.212 |
+| DINOv2 | backbone fine-tune | 0.882 | 0.954 | 0.968 | 0.577 |
+| FashionCLIP | zero-shot | 0.892 | 0.962 | 0.964 | 0.562 |
+| FashionCLIP | fine-tune | 0.932 | 0.976 | 0.982 | 0.663 |
+
+FashionCLIP은 학습을 하나도 안 했는데(zero-shot 0.892) 내가 며칠 걸려 튜닝한 DINOv2(0.882)를 이미 넘었다. 결국 이 문제에선 백본을 얼마나 잘 튜닝하느냐보다 어떤 표현을 쓰느냐가 더 컸다는 얘기다. FashionCLIP도 fine-tune하면 0.932까지 갔다.
+
+## 안 된 것들
+
+- **center-crop** — 위에 적었듯 효과 없음.
+- **re-ranking (αQE, k-reciprocal)** — 검색 후처리로 mAP를 더 올려보려 했는데 오히려 떨어졌다(0.884 → 0.72~0.80). 이런 기법은 person re-ID처럼 query당 정답이 많을 때 잘 먹히는데, 여기선 query당 정답이 몇 장뿐이고 임베딩도 이미 강해서 이웃을 끌어오면 distractor 노이즈만 늘었다. 최신 기법이라고 다 좋은 게 아니라 데이터 구조에 맞아야 한다는 걸 확인했다.
+
+## 모델이 어디를 보는지
+
+fine-tune 전후로 patch 토큰이 CLS에 얼마나 정렬되는지 히트맵으로 그려봤다(`results/attention_compare.png`). 학습 전엔 배경이랑 사람 윤곽에 반응이 퍼져 있다가, 후엔 배경이 식고 옷 쪽으로 집중이 옮겨갔다. 위 실패 분석에서 말한 "장면을 본다 → 옷을 본다"가 숫자뿐 아니라 그림으로도 보였다.
+
+## 코드
 
 ```
 src/
-  data.py       In-Shop 파싱 + 상품단위 서브샘플 (폴더구조 자동탐색)
-  embed.py      DINOv2 / CLIP / ResNet50 임베딩 (공통 인터페이스)
-  metrics.py    FAISS 검색 + Recall@k / mAP@k
-  failures.py   실패 케이스 갤러리 생성 + 자동 태깅
-  finetune.py           얼린 백본 위 projection head를 supervised-contrastive로 학습 (head-only)
-  finetune_backbone.py  DINOv2 백본 직접 fine-tune (supervised-contrastive + 증강, model_name 선택)
-retrieval.ipynb  Colab 실행 노트북 (GPU)
+  data.py                In-Shop 파싱, 폴더구조 자동인식, 상품단위 split
+  embed.py               DINOv2 / CLIP / ResNet50 임베딩
+  metrics.py             FAISS 검색 + Recall@k / mAP + re-ranking(αQE, k-reciprocal)
+  failures.py            실패 케이스 갤러리 + 자동 태깅
+  finetune.py            head-only (얼린 백본 + projection head, supcon)
+  finetune_backbone.py   DINOv2 백본 fine-tune (supcon + 증강)
+  fashion.py             FashionCLIP zero-shot / fine-tune
+  attention.py           patch-CLS 집중도 히트맵 (fine-tune 전후 비교)
+retrieval.ipynb          Colab 실행 노트북
 ```
 
-## 실행
+## 돌리는 법
 
-Colab(T4)에서 `retrieval.ipynb`를 열고 위에서부터 실행. 데이터는 노트북이 Kaggle에서 자동 다운로드.
-로컬 재현은 `pip install -r requirements.txt` 후 동일 모듈 사용.
+Colab(무료 T4)에서 `retrieval.ipynb`를 위에서부터 실행하면 된다. 데이터는 노트북이 Kaggle에서 받아온다. 임베딩은 Google Drive에 캐시해서 세션이 끊겨도 다시 안 뽑게 해놨다. 로컬에서 돌릴 거면 `pip install -r requirements.txt` 후 같은 모듈을 쓰면 된다.
 
-## 한계 · 다음
+## 남은 것 / 알아둘 점
 
-- **남은 실패는 주로 `same_category`** (같은 카테고리·비슷한 색/실루엣의 다른 상품). fine-grained 디테일(로고·패턴) 구분이 약함 → 높은 입력 해상도(224→256/336)나 부위별 crop으로 개선 여지.
-- **개선폭은 포화 근처** (0.874 → 0.884). 다음 후보: k-reciprocal re-ranking(학습 0, mAP↑), 더 큰 백본(DINOv2-L), object detection으로 의류 영역만 crop.
-- 평가는 In-Shop 서브셋(gallery 8k) 기준. 전체 gallery(52k)로 키우면 절대 수치는 낮아지되 경향은 유지될 것.
+- 남은 실패는 대부분 같은 카테고리에 색·실루엣이 비슷한 다른 상품이다. 로고나 패턴 같은 디테일 구분이 약하다. 입력 해상도를 올리거나(224→336) 의류 영역만 잘라서 넣으면 나아질 것 같다.
+- 평가는 In-Shop 서브셋(gallery 8k) 기준이라, 전체(52k)로 키우면 절대 숫자는 내려간다. 경향은 비슷할 거고.
+- 이틀 동안 혼자 한 거라 하이퍼파라미터를 촘촘히 뒤지진 못했다. split이 실행마다 흔들리지 않게 폴더 스캔을 정렬해 고정해둔 정도.
